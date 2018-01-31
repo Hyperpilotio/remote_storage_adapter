@@ -8,7 +8,6 @@ import (
 	"math"
 	"net/http"
 	"net/url"
-	"os"
 	"sync"
 	"time"
 
@@ -27,23 +26,249 @@ import (
 	"github.com/hyperpilotio/remote_storage_adapter/clients/graphite"
 	"github.com/hyperpilotio/remote_storage_adapter/clients/influxdb"
 	"github.com/hyperpilotio/remote_storage_adapter/clients/opentsdb"
+	"github.com/hyperpilotio/remote_storage_adapter/db"
+	"github.com/hyperpilotio/remote_storage_adapter/models"
 	"github.com/hyperpilotio/remote_storage_adapter/prometheus/common/promlog"
 )
 
-type config struct {
-	graphiteAddress          string
-	graphiteTransport        string
-	graphitePrefix           string
-	opentsdbURL              string
-	influxdbURL              string
-	influxdbRetentionPolicy  string
-	influxdbUsername         string
-	influxdbDatabase         string
-	influxdbPassword         string
-	remoteTimeout            time.Duration
-	listenAddr               string
-	telemetryPath            string
-	storageAdapterConfigPath string
+// Server store the stats / data of every deployment
+type Server struct {
+	Config *viper.Viper
+	AuthDB *db.AuthDB
+	Logger log.Logger
+
+	CustomerProfiles map[string]*CustomerProfile
+
+	mutex sync.Mutex
+}
+
+// NewServer return an instance of Server struct.
+func NewServer(cfg *viper.Viper) *Server {
+	logLevel := promlog.AllowedLevel{}
+	logLevel.Set("debug")
+	return &Server{
+		Config:           cfg,
+		AuthDB:           db.NewAuthDB(cfg),
+		Logger:           promlog.New(logLevel),
+		CustomerProfiles: make(map[string]*CustomerProfile),
+	}
+}
+
+// StartServer start a web servers
+func (server *Server) StartServer() error {
+	remoteTimeout, err := time.ParseDuration(server.Config.GetString("remoteTimeout"))
+	if err != nil {
+		return errors.New("Unable to parse remoteTimeout duration: %s" + err.Error())
+	}
+
+	customers, err := server.AuthDB.GetCustomers()
+	if err != nil {
+		return errors.New("Unable to get customers config: %s" + err.Error())
+	}
+
+	for _, customerCfg := range customers {
+		customerProfile := &CustomerProfile{
+			Config:               &customerCfg,
+			writers:              make([]writer, 0),
+			readers:              make([]reader, 0),
+			filterMetricPatterns: make([]glob.Glob, 0),
+		}
+
+		if customerCfg.FilterMetricsConfigURL != "" {
+			metricsConfig, err := downloadConfigFile(customerCfg.FilterMetricsConfigURL)
+			if err != nil {
+				return errors.New("Unable to download config file: %s" + err.Error())
+			}
+
+			for metricName, _ := range metricsConfig.Metrics {
+				pattern, err := glob.Compile(metricName)
+				if err != nil {
+					return fmt.Errorf("Unable to compile filter metric namespace for %s: %s", metricName, err.Error())
+				}
+				customerProfile.filterMetricPatterns = append(customerProfile.filterMetricPatterns, pattern)
+			}
+		}
+
+		if err := customerProfile.buildClients(server.Logger, remoteTimeout); err != nil {
+			return fmt.Errorf("Unable build customer clients %s: %s", customerCfg.CustomerName, err.Error())
+		}
+		server.CustomerProfiles[customerCfg.Token] = customerProfile
+	}
+
+	http.Handle(server.Config.GetString("telemetryPath"), prometheus.Handler())
+	http.HandleFunc("/write", server.write)
+	http.HandleFunc("/read", server.read)
+
+	level.Info(server.Logger).Log("Starting up...")
+	return http.ListenAndServe(":"+server.Config.GetString("listenAddr"), nil)
+}
+
+type writer interface {
+	Write(samples model.Samples) error
+	Name() string
+}
+
+type reader interface {
+	Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error)
+	Name() string
+}
+
+type CustomerProfile struct {
+	Config               *models.CustomerConfig
+	writers              []writer
+	readers              []reader
+	filterMetricPatterns []glob.Glob
+}
+
+func (cp *CustomerProfile) buildClients(logger log.Logger, remoteTimeout time.Duration) error {
+	if cp.Config.GraphiteAddress != "" {
+		c := graphite.NewClient(
+			log.With(logger, "storage", "Graphite"),
+			cp.Config.GraphiteAddress, cp.Config.GraphiteTransport,
+			remoteTimeout, cp.Config.GraphitePrefix)
+		cp.writers = append(cp.writers, c)
+	}
+	if cp.Config.OpentsdbURL != "" {
+		c := opentsdb.NewClient(
+			log.With(logger, "storage", "OpenTSDB"),
+			cp.Config.OpentsdbURL,
+			remoteTimeout,
+		)
+		cp.writers = append(cp.writers, c)
+	}
+	if cp.Config.InfluxdbURL != "" {
+		url, err := url.Parse(cp.Config.InfluxdbURL)
+		if err != nil {
+			return fmt.Errorf("Failed to parse InfluxDB URL %s: %s", cp.Config.InfluxdbURL, err.Error())
+		}
+		conf := influx.HTTPConfig{
+			Addr:     url.String(),
+			Username: cp.Config.InfluxdbUsername,
+			Password: cp.Config.InfluxdbPassword,
+			Timeout:  remoteTimeout,
+		}
+		c := influxdb.NewClient(
+			log.With(logger, "storage", "InfluxDB"),
+			conf,
+			cp.Config.InfluxdbDatabase,
+			cp.Config.InfluxdbRetentionPolicy,
+		)
+		prometheus.MustRegister(c)
+		cp.writers = append(cp.writers, c)
+		cp.readers = append(cp.readers, c)
+	}
+	return nil
+}
+
+func (server *Server) write(w http.ResponseWriter, r *http.Request) {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+
+	tokenId := r.FormValue("tokenId")
+	customerProfile, ok := server.CustomerProfiles[tokenId]
+	if !ok {
+		level.Error(server.Logger).Log("msg", "CustomerProfile not found")
+		http.Error(w, "CustomerProfile not found", http.StatusInternalServerError)
+		return
+	}
+
+	compressed, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		level.Error(server.Logger).Log("msg", "Read error", "err", err.Error())
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	reqBuf, err := snappy.Decode(nil, compressed)
+	if err != nil {
+		level.Error(server.Logger).Log("msg", "Decode error", "err", err.Error())
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var req prompb.WriteRequest
+	if err := proto.Unmarshal(reqBuf, &req); err != nil {
+		level.Error(server.Logger).Log("msg", "Unmarshal error", "err", err.Error())
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	samples := protoToSamples(&req, customerProfile.filterMetricPatterns)
+	receivedSamples.Add(float64(len(samples)))
+
+	var wg sync.WaitGroup
+	for _, w := range customerProfile.writers {
+		wg.Add(1)
+		go func(rw writer) {
+			sendSamples(server.Logger, rw, samples)
+			wg.Done()
+		}(w)
+	}
+	wg.Wait()
+}
+
+func (server *Server) read(w http.ResponseWriter, r *http.Request) {
+	server.mutex.Lock()
+	defer server.mutex.Unlock()
+
+	tokenId := r.FormValue("tokenId")
+	customerProfile, ok := server.CustomerProfiles[tokenId]
+	if !ok {
+		level.Error(server.Logger).Log("msg", "CustomerProfile not found")
+		http.Error(w, "CustomerProfile not found", http.StatusInternalServerError)
+		return
+	}
+
+	compressed, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		level.Error(server.Logger).Log("msg", "Read error", "err", err.Error())
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	reqBuf, err := snappy.Decode(nil, compressed)
+	if err != nil {
+		level.Error(server.Logger).Log("msg", "Decode error", "err", err.Error())
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	var req prompb.ReadRequest
+	if err := proto.Unmarshal(reqBuf, &req); err != nil {
+		level.Error(server.Logger).Log("msg", "Unmarshal error", "err", err.Error())
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// TODO: Support reading from more than one reader and merging the results.
+	if len(customerProfile.readers) != 1 {
+		http.Error(w, fmt.Sprintf("expected exactly one reader, found %d readers", len(customerProfile.readers)), http.StatusInternalServerError)
+		return
+	}
+	reader := customerProfile.readers[0]
+
+	var resp *prompb.ReadResponse
+	resp, err = reader.Read(&req)
+	if err != nil {
+		level.Warn(server.Logger).Log("msg", "Error executing query", "query", req, "storage", reader.Name(), "err", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	data, err := proto.Marshal(resp)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/x-protobuf")
+	w.Header().Set("Content-Encoding", "snappy")
+
+	compressed = snappy.Encode(nil, data)
+	if _, err := w.Write(compressed); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 }
 
 type metricInfo struct {
@@ -52,150 +277,6 @@ type metricInfo struct {
 
 type MetricsConfig struct {
 	Metrics map[string]metricInfo `json:"metrics"`
-}
-
-type CustomerProfile struct {
-	Token     string
-	ClusterId string
-}
-
-// Server store the stats / data of every deployment
-type Server struct {
-	Config           *config
-	AdapterConfig    *viper.Viper
-	CustomerProfiles map[string]*CustomerProfile
-	Logger           log.Logger
-
-	mutex sync.Mutex
-}
-
-// NewServer return an instance of Server struct.
-func NewServer(cfg *config, adapterCfg *viper.Viper) *Server {
-	logLevel := promlog.AllowedLevel{}
-	logLevel.Set("debug")
-	logger := promlog.New(logLevel)
-	return &Server{
-		Config:           cfg,
-		AdapterConfig:    adapterCfg,
-		Logger:           logger,
-		CustomerProfiles: make(map[string]*CustomerProfile),
-	}
-}
-
-// StartServer start a web servers
-func (server *Server) StartServer() error {
-	http.Handle(server.Config.telemetryPath, prometheus.Handler())
-	writers, readers := buildClients(server.Logger, server.Config)
-
-	filterMetricPatterns := []glob.Glob{}
-	if filterMetricsConfigUrl := server.AdapterConfig.GetString("filterMetricsConfigUrl"); filterMetricsConfigUrl != "" {
-		metricsConfig, err := downloadConfigFile(filterMetricsConfigUrl)
-		if err != nil {
-			level.Error(server.Logger).Log("msg", "Read error", "err", err.Error())
-		}
-		for metricName, _ := range metricsConfig.Metrics {
-			pattern, err := glob.Compile(metricName)
-			if err != nil {
-				level.Error(server.Logger).Log(
-					"msg", "Unable to compile filter metric namespace",
-					"name", metricName,
-					"err", err.Error(),
-				)
-			}
-			filterMetricPatterns = append(filterMetricPatterns, pattern)
-		}
-	}
-
-	http.HandleFunc("/write", func(w http.ResponseWriter, r *http.Request) {
-		compressed, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			level.Error(server.Logger).Log("msg", "Read error", "err", err.Error())
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		reqBuf, err := snappy.Decode(nil, compressed)
-		if err != nil {
-			level.Error(server.Logger).Log("msg", "Decode error", "err", err.Error())
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		var req prompb.WriteRequest
-		if err := proto.Unmarshal(reqBuf, &req); err != nil {
-			level.Error(server.Logger).Log("msg", "Unmarshal error", "err", err.Error())
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		samples := protoToSamples(&req, filterMetricPatterns)
-		receivedSamples.Add(float64(len(samples)))
-
-		var wg sync.WaitGroup
-		for _, w := range writers {
-			wg.Add(1)
-			go func(rw writer) {
-				sendSamples(server.Logger, rw, samples)
-				wg.Done()
-			}(w)
-		}
-		wg.Wait()
-	})
-
-	http.HandleFunc("/read", func(w http.ResponseWriter, r *http.Request) {
-		compressed, err := ioutil.ReadAll(r.Body)
-		if err != nil {
-			level.Error(server.Logger).Log("msg", "Read error", "err", err.Error())
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		reqBuf, err := snappy.Decode(nil, compressed)
-		if err != nil {
-			level.Error(server.Logger).Log("msg", "Decode error", "err", err.Error())
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		var req prompb.ReadRequest
-		if err := proto.Unmarshal(reqBuf, &req); err != nil {
-			level.Error(server.Logger).Log("msg", "Unmarshal error", "err", err.Error())
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-
-		// TODO: Support reading from more than one reader and merging the results.
-		if len(readers) != 1 {
-			http.Error(w, fmt.Sprintf("expected exactly one reader, found %d readers", len(readers)), http.StatusInternalServerError)
-			return
-		}
-		reader := readers[0]
-
-		var resp *prompb.ReadResponse
-		resp, err = reader.Read(&req)
-		if err != nil {
-			level.Warn(server.Logger).Log("msg", "Error executing query", "query", req, "storage", reader.Name(), "err", err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		data, err := proto.Marshal(resp)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/x-protobuf")
-		w.Header().Set("Content-Encoding", "snappy")
-
-		compressed = snappy.Encode(nil, data)
-		if _, err := w.Write(compressed); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-	})
-
-	return http.ListenAndServe(server.Config.listenAddr, nil)
 }
 
 func downloadConfigFile(url string) (*MetricsConfig, error) {
@@ -212,60 +293,6 @@ func downloadConfigFile(url string) (*MetricsConfig, error) {
 	}
 
 	return &configs, nil
-}
-
-type writer interface {
-	Write(samples model.Samples) error
-	Name() string
-}
-
-type reader interface {
-	Read(req *prompb.ReadRequest) (*prompb.ReadResponse, error)
-	Name() string
-}
-
-func buildClients(logger log.Logger, cfg *config) ([]writer, []reader) {
-	var writers []writer
-	var readers []reader
-	if cfg.graphiteAddress != "" {
-		c := graphite.NewClient(
-			log.With(logger, "storage", "Graphite"),
-			cfg.graphiteAddress, cfg.graphiteTransport,
-			cfg.remoteTimeout, cfg.graphitePrefix)
-		writers = append(writers, c)
-	}
-	if cfg.opentsdbURL != "" {
-		c := opentsdb.NewClient(
-			log.With(logger, "storage", "OpenTSDB"),
-			cfg.opentsdbURL,
-			cfg.remoteTimeout,
-		)
-		writers = append(writers, c)
-	}
-	if cfg.influxdbURL != "" {
-		url, err := url.Parse(cfg.influxdbURL)
-		if err != nil {
-			level.Error(logger).Log("msg", "Failed to parse InfluxDB URL", "url", cfg.influxdbURL, "err", err)
-			os.Exit(1)
-		}
-		conf := influx.HTTPConfig{
-			Addr:     url.String(),
-			Username: cfg.influxdbUsername,
-			Password: cfg.influxdbPassword,
-			Timeout:  cfg.remoteTimeout,
-		}
-		c := influxdb.NewClient(
-			log.With(logger, "storage", "InfluxDB"),
-			conf,
-			cfg.influxdbDatabase,
-			cfg.influxdbRetentionPolicy,
-		)
-		prometheus.MustRegister(c)
-		writers = append(writers, c)
-		readers = append(readers, c)
-	}
-	level.Info(logger).Log("Starting up...")
-	return writers, readers
 }
 
 func protoToSamples(req *prompb.WriteRequest, filterMetricPatterns []glob.Glob) model.Samples {

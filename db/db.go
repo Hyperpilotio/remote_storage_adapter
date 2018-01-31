@@ -4,9 +4,9 @@ import (
 	"errors"
 	"fmt"
 
+	mgo "gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 
-	"github.com/golang/glog"
 	"github.com/hyperpilotio/remote_storage_adapter/models"
 	"github.com/spf13/viper"
 )
@@ -44,21 +44,20 @@ func connectMongo(url string, database string, user string, password string) (*m
 	return session, nil
 }
 
-func (authDB *AuthDB) GetCustomerConfig(token string) (*models.CustomerConfig, error) {
-	session, sessionErr := connectMongo(configDb.Url, configDb.Database, configDb.User, configDb.Password)
+func (authDB *AuthDB) GetCustomers() ([]models.CustomerConfig, error) {
+	session, sessionErr := connectMongo(authDB.Url, authDB.Database, authDB.User, authDB.Password)
 	if sessionErr != nil {
 		return nil, errors.New("Unable to create mongo session: " + sessionErr.Error())
 	}
-	glog.V(1).Infof("Successfully connected to the config DB for app %s", name)
 	defer session.Close()
 
+	var customers []models.CustomerConfig
 	collection := session.DB(authDB.Database).C(authDB.CustomerCollection)
-	var customerConfig models.CustomerConfig
-	if err := collection.Find(bson.M{"token": token}).One(&customerConfig); err != nil {
-		return nil, errors.New("Unable to find customer config from db: " + err.Error())
+	if err := collection.Find(nil).All(&customers); err != nil {
+		return nil, errors.New("Unable to read customers from auth db: " + err.Error())
 	}
 
-	return &customerConfig, nil
+	return customers, nil
 }
 
 func (authDB *AuthDB) getCollection(dataType string) (string, error) {
