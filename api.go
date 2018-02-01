@@ -23,9 +23,7 @@ import (
 
 	influx "github.com/influxdata/influxdb/client/v2"
 
-	"github.com/hyperpilotio/remote_storage_adapter/clients/graphite"
 	"github.com/hyperpilotio/remote_storage_adapter/clients/influxdb"
-	"github.com/hyperpilotio/remote_storage_adapter/clients/opentsdb"
 	"github.com/hyperpilotio/remote_storage_adapter/db"
 	"github.com/hyperpilotio/remote_storage_adapter/models"
 	"github.com/hyperpilotio/remote_storage_adapter/prometheus/common/promlog"
@@ -37,9 +35,8 @@ type Server struct {
 	AuthDB *db.AuthDB
 	Logger log.Logger
 
-	CustomerProfiles map[string]*CustomerProfile
-
-	mutex sync.Mutex
+	CustomerProfiles    map[string]*CustomerProfile
+	customerProfileLock sync.RWMutex
 }
 
 // NewServer return an instance of Server struct.
@@ -66,27 +63,29 @@ func (server *Server) StartServer() error {
 		return errors.New("Unable to get customers config: %s" + err.Error())
 	}
 
+	filterMetricPatterns := []glob.Glob{}
+	filterMetricsConfigUrl := server.Config.GetString("filterMetricsConfigUrl")
+	if filterMetricsConfigUrl != "" {
+		metricsConfig, err := downloadConfigFile(filterMetricsConfigUrl)
+		if err != nil {
+			return errors.New("Unable to download config file: %s" + err.Error())
+		}
+
+		for metricName, _ := range metricsConfig.Metrics {
+			pattern, err := glob.Compile(metricName)
+			if err != nil {
+				return fmt.Errorf("Unable to compile filter metric namespace for %s: %s", metricName, err.Error())
+			}
+			filterMetricPatterns = append(filterMetricPatterns, pattern)
+		}
+	}
+
 	for _, customerCfg := range customers {
 		customerProfile := &CustomerProfile{
 			Config:               &customerCfg,
 			writers:              make([]writer, 0),
 			readers:              make([]reader, 0),
-			filterMetricPatterns: make([]glob.Glob, 0),
-		}
-
-		if customerCfg.FilterMetricsConfigURL != "" {
-			metricsConfig, err := downloadConfigFile(customerCfg.FilterMetricsConfigURL)
-			if err != nil {
-				return errors.New("Unable to download config file: %s" + err.Error())
-			}
-
-			for metricName, _ := range metricsConfig.Metrics {
-				pattern, err := glob.Compile(metricName)
-				if err != nil {
-					return fmt.Errorf("Unable to compile filter metric namespace for %s: %s", metricName, err.Error())
-				}
-				customerProfile.filterMetricPatterns = append(customerProfile.filterMetricPatterns, pattern)
-			}
+			filterMetricPatterns: filterMetricPatterns,
 		}
 
 		if err := customerProfile.buildClients(server.Logger, remoteTimeout); err != nil {
@@ -121,21 +120,6 @@ type CustomerProfile struct {
 }
 
 func (cp *CustomerProfile) buildClients(logger log.Logger, remoteTimeout time.Duration) error {
-	if cp.Config.GraphiteAddress != "" {
-		c := graphite.NewClient(
-			log.With(logger, "storage", "Graphite"),
-			cp.Config.GraphiteAddress, cp.Config.GraphiteTransport,
-			remoteTimeout, cp.Config.GraphitePrefix)
-		cp.writers = append(cp.writers, c)
-	}
-	if cp.Config.OpentsdbURL != "" {
-		c := opentsdb.NewClient(
-			log.With(logger, "storage", "OpenTSDB"),
-			cp.Config.OpentsdbURL,
-			remoteTimeout,
-		)
-		cp.writers = append(cp.writers, c)
-	}
 	if cp.Config.InfluxdbURL != "" {
 		url, err := url.Parse(cp.Config.InfluxdbURL)
 		if err != nil {
@@ -160,14 +144,22 @@ func (cp *CustomerProfile) buildClients(logger log.Logger, remoteTimeout time.Du
 	return nil
 }
 
-func (server *Server) write(w http.ResponseWriter, r *http.Request) {
-	server.mutex.Lock()
-	defer server.mutex.Unlock()
+func (server *Server) getCustomerProfile(tokenId string) (*CustomerProfile, error) {
+	server.customerProfileLock.RLock()
+	defer server.customerProfileLock.RUnlock()
 
-	tokenId := r.FormValue("tokenId")
 	customerProfile, ok := server.CustomerProfiles[tokenId]
 	if !ok {
-		level.Error(server.Logger).Log("msg", "CustomerProfile not found")
+		return nil, errors.New("Unable to find CustomerProfile")
+	}
+	return customerProfile, nil
+}
+
+func (server *Server) write(w http.ResponseWriter, r *http.Request) {
+	tokenId := r.FormValue("tokenId")
+	customerProfile, err := server.getCustomerProfile(tokenId)
+	if err != nil {
+		level.Error(server.Logger).Log("msg", "CustomerProfile not found: "+err.Error())
 		http.Error(w, "CustomerProfile not found", http.StatusInternalServerError)
 		return
 	}
@@ -208,13 +200,10 @@ func (server *Server) write(w http.ResponseWriter, r *http.Request) {
 }
 
 func (server *Server) read(w http.ResponseWriter, r *http.Request) {
-	server.mutex.Lock()
-	defer server.mutex.Unlock()
-
 	tokenId := r.FormValue("tokenId")
-	customerProfile, ok := server.CustomerProfiles[tokenId]
-	if !ok {
-		level.Error(server.Logger).Log("msg", "CustomerProfile not found")
+	customerProfile, err := server.getCustomerProfile(tokenId)
+	if err != nil {
+		level.Error(server.Logger).Log("msg", "CustomerProfile not found: "+err.Error())
 		http.Error(w, "CustomerProfile not found", http.StatusInternalServerError)
 		return
 	}
