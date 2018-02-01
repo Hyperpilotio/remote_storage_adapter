@@ -1,9 +1,6 @@
 package: github.com/hyperpilotio/remote_storage_adapter
 import:
-- package: github.com/go-kit/kit
-  subpackages:
-  - log
-  - log/level
+- package: github.com/cenkalti/backoff
 - package: github.com/gobwas/glob
 - package: github.com/gogo/protobuf
   subpackages:
@@ -13,7 +10,6 @@ import:
 - package: github.com/influxdata/influxdb
   subpackages:
   - client/v2
-- package: github.com/pkg/errors
 - package: github.com/prometheus/client_golang
   subpackages:
   - prometheus
@@ -23,11 +19,8 @@ import:
 - package: github.com/prometheus/prometheus
   subpackages:
   - prompb
+- package: github.com/sirupsen/logrus
 - package: github.com/spf13/viper
-- package: golang.org/x/net
-  subpackages:
-  - context/ctxhttp
-- package: gopkg.in/alecthomas/kingpin.v2
 - package: gopkg.in/mgo.v2
   subpackages:
   - bson
