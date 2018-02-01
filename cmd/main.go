@@ -6,6 +6,7 @@ import (
 
 	"github.com/golang/glog"
 	"github.com/prometheus/client_golang/prometheus"
+	log "github.com/sirupsen/logrus"
 	"github.com/spf13/viper"
 )
 
@@ -75,6 +76,11 @@ func Run(fileConfig string) error {
 	}
 
 	server := NewServer(config)
+	if err := server.Init(); err != nil {
+		log.Errorf("Server Init() fail: %s", err.Error())
+	}
+
+	log.Infof("Storage apapter start running...")
 	return server.StartServer()
 }
 

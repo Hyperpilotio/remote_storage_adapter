@@ -1,4 +1,4 @@
-package models
+package model
 
 type InfluxdbClientConfig struct {
 	InfluxdbURL             string `bson:"influxdbURL" json:"influxdbURL"`
@@ -9,10 +9,9 @@ type InfluxdbClientConfig struct {
 }
 
 type CustomerConfig struct {
-	Token                  string `bson:"token" json:"token"`
-	CustomerName           string `bson:"customerName" json:"customerName"`
-	ClusterId              string `bson:"clusterId" json:"clusterId"`
-	FilterMetricsConfigURL string `bson:"filterMetricsConfigURL" json:"filterMetricsConfigURL"`
+	Token      string `bson:"token" json:"token"`
+	CustomerId string `bson:"customerId" json:"customerId"`
+	ClusterId  string `bson:"clusterId" json:"clusterId"`
 
 	InfluxdbClientConfig
 }

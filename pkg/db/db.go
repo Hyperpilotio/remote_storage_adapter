@@ -7,7 +7,7 @@ import (
 	mgo "gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 
-	"github.com/hyperpilotio/remote_storage_adapter/models"
+	"github.com/hyperpilotio/remote_storage_adapter/pkg/common/model"
 	"github.com/spf13/viper"
 )
 
@@ -44,14 +44,14 @@ func connectMongo(url string, database string, user string, password string) (*m
 	return session, nil
 }
 
-func (authDB *AuthDB) GetCustomers() ([]models.CustomerConfig, error) {
+func (authDB *AuthDB) GetCustomers() ([]model.CustomerConfig, error) {
 	session, sessionErr := connectMongo(authDB.Url, authDB.Database, authDB.User, authDB.Password)
 	if sessionErr != nil {
 		return nil, errors.New("Unable to create mongo session: " + sessionErr.Error())
 	}
 	defer session.Close()
 
-	var customers []models.CustomerConfig
+	var customers []model.CustomerConfig
 	collection := session.DB(authDB.Database).C(authDB.CustomerCollection)
 	if err := collection.Find(nil).All(&customers); err != nil {
 		return nil, errors.New("Unable to read customers from auth db: " + err.Error())
