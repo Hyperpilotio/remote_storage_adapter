@@ -51,6 +51,7 @@ func NewServer(cfg *viper.Viper) *Server {
 		Config:           cfg,
 		AuthDB:           db.NewAuthDB(cfg),
 		CustomerProfiles: make(map[string]*CustomerProfile),
+		Writers:          make(map[string]*HyperpilotWriter),
 	}
 }
 
@@ -155,7 +156,7 @@ func (server *Server) getCustomerProfile(tokenId string) (*CustomerProfile, erro
 }
 
 func (server *Server) write(w http.ResponseWriter, r *http.Request) {
-	tokenId := r.FormValue("tokenId")
+	tokenId := r.FormValue("token")
 	customerProfile, err := server.getCustomerProfile(tokenId)
 	if err != nil {
 		log.Errorf("CustomerProfile not found: %s", err.Error())
@@ -190,7 +191,7 @@ func (server *Server) write(w http.ResponseWriter, r *http.Request) {
 }
 
 func (server *Server) read(w http.ResponseWriter, r *http.Request) {
-	tokenId := r.FormValue("tokenId")
+	tokenId := r.FormValue("token")
 	customerProfile, err := server.getCustomerProfile(tokenId)
 	if err != nil {
 		log.Errorf("CustomerProfile not found: %s", err.Error())
