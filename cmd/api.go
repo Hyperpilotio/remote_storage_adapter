@@ -144,20 +144,25 @@ type CustomerProfile struct {
 	HyperpilotWriter     *HyperpilotWriter
 }
 
-func (server *Server) getCustomerProfile(tokenId string) (*CustomerProfile, error) {
+func (server *Server) getCustomerProfile(token string) (*CustomerProfile, error) {
 	server.customerProfileLock.RLock()
 	defer server.customerProfileLock.RUnlock()
 
-	customerProfile, ok := server.CustomerProfiles[tokenId]
+	// TODO: decode token and get customerId
+	// We assume customerId is hyperpilotio
+	customerId := "hyperpilotio"
+
+	customerProfile, ok := server.CustomerProfiles[customerId]
 	if !ok {
 		return nil, errors.New("Unable to find CustomerProfile")
 	}
+
 	return customerProfile, nil
 }
 
 func (server *Server) write(w http.ResponseWriter, r *http.Request) {
-	tokenId := r.FormValue("token")
-	customerProfile, err := server.getCustomerProfile(tokenId)
+	token := r.FormValue("token")
+	customerProfile, err := server.getCustomerProfile(token)
 	if err != nil {
 		log.Errorf("CustomerProfile not found: %s", err.Error())
 		http.Error(w, "CustomerProfile not found", http.StatusInternalServerError)
@@ -191,8 +196,8 @@ func (server *Server) write(w http.ResponseWriter, r *http.Request) {
 }
 
 func (server *Server) read(w http.ResponseWriter, r *http.Request) {
-	tokenId := r.FormValue("token")
-	customerProfile, err := server.getCustomerProfile(tokenId)
+	token := r.FormValue("token")
+	customerProfile, err := server.getCustomerProfile(token)
 	if err != nil {
 		log.Errorf("CustomerProfile not found: %s", err.Error())
 		http.Error(w, "CustomerProfile not found", http.StatusInternalServerError)
