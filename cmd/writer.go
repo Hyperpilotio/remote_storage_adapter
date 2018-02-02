@@ -50,28 +50,31 @@ func (hpwriter *HyperpilotWriter) Run() {
 
 		for {
 			if !hpwriter.Queue.Empty() {
-				go func(customerId string, w writer) {
-					var batchSamples model.Samples
-					for i := 0; i < batchSize; i++ {
-						sample := hpwriter.Queue.Dequeue()
-						if sample == nil {
-							log.Warnf("Writer {%s} get nil sample, because element number inside of queue is less than batch size {%d}",
-								hpwriter.CustomerId, batchSize)
-							continue
-						}
-						batchSamples = append(batchSamples, sample.(model.Samples)...)
+				var batchSamples model.Samples
+				for i := 0; i < batchSize; i++ {
+					sample := hpwriter.Queue.Dequeue()
+					if sample == nil {
+						log.Warnf("Writer {%s} get nil sample, because element number inside of queue is less than batch size {%d}",
+							hpwriter.CustomerId, batchSize)
+						break
 					}
+					batchSamples = append(batchSamples, sample.(model.Samples)...)
+				}
 
-					retryWrite := func() error {
-						return sendSamples(w, batchSamples)
-					}
+				if len(batchSamples) == 0 {
+					continue
+				}
 
-					err := backoff.Retry(retryWrite, b)
-					if err != nil {
-						log.Warnf("Writer {%s} push sample fail, %d sample are dropped: %s", customerId, len(batchSamples), err.Error())
-					}
-				}(hpwriter.CustomerId, hpwriter.Writer)
-				// time.Sleep(1 * time.Second)
+				retryWrite := func() error {
+					return sendSamples(hpwriter.Writer, batchSamples)
+				}
+
+				err := backoff.Retry(retryWrite, b)
+				if err != nil {
+					log.Warnf("Writer {%s} push sample fail, %d sample are dropped: %s",
+						hpwriter.CustomerId, len(batchSamples), err.Error())
+				}
+				time.Sleep(1 * time.Second)
 			}
 		}
 	}()
@@ -82,13 +85,20 @@ func (writer *HyperpilotWriter) Put(samples model.Samples) {
 }
 
 func sendSamples(w writer, samples model.Samples) error {
+	sampleSize := len(samples)
 	begin := time.Now()
 	err := w.Write(samples)
 	duration := time.Since(begin).Seconds()
-	sentSamples.WithLabelValues(w.Name()).Add(float64(len(samples)))
+	sentSamples.WithLabelValues(w.Name()).Add(float64(sampleSize))
 	sentBatchDuration.WithLabelValues(w.Name()).Observe(duration)
+
+	log.WithFields(log.Fields{
+		"StartTime": begin,
+		"Duration":  duration,
+	}).Infof("Send %d samples to %s", sampleSize, w.Name())
+
 	if err != nil {
-		failedSamples.WithLabelValues(w.Name()).Add(float64(len(samples)))
+		failedSamples.WithLabelValues(w.Name()).Add(float64(sampleSize))
 		return errors.New("Unable to sending samples to remote storage:" + err.Error())
 	}
 
