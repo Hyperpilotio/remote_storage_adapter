@@ -1,4 +1,4 @@
-ORGANIZATION=hyperpilot
+ORGANIZATION=jpra1113
 IMAGE=prometheus_adapter
 TAG=latest
 
