@@ -1,4 +1,4 @@
-ORGANIZATION=jpra1113
+ORGANIZATION=hyperpilot
 IMAGE=prometheus_adapter
 TAG=latest
 
@@ -8,6 +8,6 @@ build:
 	rm -rf bin/*
 	CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o bin/linux/$(IMAGE) ./cmd
 docker-build:
-	sudo docker build -t $(ORGANIZATION)/$(IMAGE):$(TAG) .
+	docker build -t $(ORGANIZATION)/$(IMAGE):$(TAG) .
 docker-push: build docker-build
-	sudo docker push $(ORGANIZATION)/$(IMAGE):$(TAG)
+	docker push $(ORGANIZATION)/$(IMAGE):$(TAG)
