@@ -2,7 +2,7 @@
     "remoteTimeout": "30s",
     "listenAddr": 9201,
     "writer": {
-        "queueSize": 100,
+        "queueSize": 10000,
         "timeOut": "3m",
         "batchSize": 10
     },
