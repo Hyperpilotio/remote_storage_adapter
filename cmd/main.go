@@ -77,7 +77,7 @@ func Run(fileConfig string) error {
 
 	server := NewServer(config)
 	if err := server.Init(); err != nil {
-		log.Errorf("Server Init() fail: %s", err.Error())
+		return errors.New("Unable to run server init: " + err.Error())
 	}
 
 	log.Infof("Storage apapter start running...")
