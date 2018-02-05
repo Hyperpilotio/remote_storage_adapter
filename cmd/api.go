@@ -184,30 +184,29 @@ func (server *Server) getCustomerProfile(token string) (*CustomerProfile, error)
 	clusterId := "001"
 
 	customerProfile, ok := server.CustomerProfiles[customerId]
-	if !ok {
-		customerConfig := &hpmodel.CustomerConfig{
+	if ok {
+		return customerProfile, nil
+	}
+
+	customerProfile = &CustomerProfile{
+		Config: &hpmodel.CustomerConfig{
 			Token:      token,
 			CustomerId: customerId,
 			ClusterId:  clusterId,
-		}
-		if err := server.AuthDB.WriteMetrics("customer", customerConfig); err != nil {
-			return nil, errors.New("Unable write customer data to mongo:" + err.Error())
-		}
-
-		customerProfile := &CustomerProfile{
-			Config: customerConfig,
-		}
-
-		if err := buildClients(server.GlobInfluxdbConfig, customerProfile); err != nil {
-			return nil, fmt.Errorf("Unable to build customer clients %s: %s", customerId, err.Error())
-		}
-
-		if err := server.CreateHyperpilotWriter(customerProfile); err != nil {
-			return nil, fmt.Errorf("Unable tp create hyperpilot writer %s: %s", customerId, err.Error())
-		}
-		server.CustomerProfiles[customerId] = customerProfile
+		},
+	}
+	if err := server.AuthDB.WriteMetrics("customer", customerProfile.Config); err != nil {
+		return nil, errors.New("Unable write customer data to mongo:" + err.Error())
 	}
 
+	if err := buildClients(server.GlobInfluxdbConfig, customerProfile); err != nil {
+		return nil, fmt.Errorf("Unable to build customer clients %s: %s", customerId, err.Error())
+	}
+
+	if err := server.CreateHyperpilotWriter(customerProfile); err != nil {
+		return nil, fmt.Errorf("Unable tp create hyperpilot writer %s: %s", customerId, err.Error())
+	}
+	server.CustomerProfiles[customerId] = customerProfile
 	return customerProfile, nil
 }
 
