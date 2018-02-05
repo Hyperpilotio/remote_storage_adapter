@@ -9,7 +9,7 @@
     "telemetryPath": "/metrics",
     "filterMetricsConfigUrl": "http:\/\/s3.amazonaws.com\/jpra1113-remote_storage_adapter\/filter-metric-config.json",
     "database": {
-        "url": "ds117758.mlab.com:17758",
+        "url": "mongo-serve:27017",
         "user": "analyzer",
         "password": "hyperpilot",
         "configDatabase": "authdb",
