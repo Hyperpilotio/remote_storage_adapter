@@ -29,11 +29,20 @@ import (
 	"github.com/hyperpilotio/remote_storage_adapter/pkg/db"
 )
 
+type GlobInfluxdbConfig struct {
+	Username             string
+	Password             string
+	Database             string
+	RetentionPolicy      string
+	RemoteTimeout        time.Duration
+	FilterMetricPatterns []glob.Glob
+}
+
 // Server store the stats / data of every customerProfile
 type Server struct {
-	Config               *viper.Viper
-	AuthDB               *db.AuthDB
-	filterMetricPatterns []glob.Glob
+	Config             *viper.Viper
+	AuthDB             *db.AuthDB
+	GlobInfluxdbConfig *GlobInfluxdbConfig
 
 	customerProfileLock sync.RWMutex
 	CustomerProfiles    map[string]*CustomerProfile
@@ -49,8 +58,15 @@ func init() {
 // NewServer return an instance of Server struct.
 func NewServer(cfg *viper.Viper) *Server {
 	return &Server{
-		Config:           cfg,
-		AuthDB:           db.NewAuthDB(cfg),
+		Config: cfg,
+		AuthDB: db.NewAuthDB(cfg),
+		GlobInfluxdbConfig: &GlobInfluxdbConfig{
+			Username:             cfg.GetString("influxdb.username"),
+			Password:             cfg.GetString("influxdb.password"),
+			Database:             cfg.GetString("influxdb.database"),
+			RetentionPolicy:      cfg.GetString("influxdb.retentionPolicy"),
+			FilterMetricPatterns: make([]glob.Glob, 0),
+		},
 		CustomerProfiles: make(map[string]*CustomerProfile),
 		Writers:          make(map[string]*HyperpilotWriter),
 	}
@@ -61,13 +77,8 @@ func (server *Server) Init() error {
 	if err != nil {
 		return errors.New("Unable to parse remoteTimeout duration: %s" + err.Error())
 	}
+	server.GlobInfluxdbConfig.RemoteTimeout = remoteTimeout
 
-	customers, err := server.AuthDB.GetCustomers()
-	if err != nil {
-		return errors.New("Unable to get customers config: %s" + err.Error())
-	}
-
-	filterMetricPatterns := []glob.Glob{}
 	filterMetricsConfigUrl := server.Config.GetString("filterMetricsConfigUrl")
 	if filterMetricsConfigUrl != "" {
 		metricsConfig, err := downloadConfigFile(filterMetricsConfigUrl)
@@ -78,19 +89,29 @@ func (server *Server) Init() error {
 		for metricName, _ := range metricsConfig.Metrics {
 			pattern, err := glob.Compile(metricName)
 			if err != nil {
-				return fmt.Errorf("Unable to compile filter metric namespace for %s: %s", metricName, err.Error())
+				return fmt.Errorf("Unable to compile filter metric namespace for %s: %s",
+					metricName, err.Error())
 			}
-			filterMetricPatterns = append(filterMetricPatterns, pattern)
+			server.GlobInfluxdbConfig.FilterMetricPatterns =
+				append(server.GlobInfluxdbConfig.FilterMetricPatterns, pattern)
 		}
 	}
 
+	customers, err := server.AuthDB.GetCustomers()
+	if err != nil {
+		return errors.New("Unable to get customers config: %s" + err.Error())
+	}
 	for _, customerCfg := range customers {
 		customerProfile := &CustomerProfile{
 			Config: &customerCfg,
 		}
 
-		if err := buildClients(server, customerProfile, remoteTimeout); err != nil {
-			return fmt.Errorf("Unable build customer clients %s: %s", customerCfg.CustomerId, err.Error())
+		if err := buildClients(server.GlobInfluxdbConfig, customerProfile); err != nil {
+			return fmt.Errorf("Unable to build customer clients %s: %s", customerCfg.CustomerId, err.Error())
+		}
+
+		if err := server.CreateHyperpilotWriter(customerProfile); err != nil {
+			return fmt.Errorf("Unable tp create hyperpilot writer %s: %s", customerCfg.CustomerId, err.Error())
 		}
 		server.CustomerProfiles[customerCfg.CustomerId] = customerProfile
 	}
@@ -106,21 +127,24 @@ func (server *Server) StartServer() error {
 	return http.ListenAndServe(":"+server.Config.GetString("listenAddr"), nil)
 }
 
-func (server *Server) CreateWriter(cp *CustomerProfile) error {
+func (server *Server) CreateHyperpilotWriter(cp *CustomerProfile) error {
 	server.writerLock.Lock()
 	defer server.writerLock.Unlock()
+
+	writer, ok := server.Writers[cp.Config.CustomerId]
+	if ok {
+		log.Warnf("Writer customerId {%s} is duplicated, skip this writer", cp.Config.CustomerId)
+		cp.HyperpilotWriter = writer
+		return nil
+	}
 
 	hpWriter, err := NewHyperpilotWriter(server, cp.writer, cp.Config.CustomerId)
 	if err != nil {
 		return fmt.Errorf("Unable to new writer for customerId={%s}: %s", cp.Config.CustomerId, err.Error())
 	}
-	cp.HyperpilotWriter = hpWriter
 	hpWriter.Run()
 
-	if _, ok := server.Writers[cp.Config.CustomerId]; ok {
-		log.Warnf("Writer customerId {%s} is duplicated, skip this writer", cp.Config.CustomerId)
-		return nil
-	}
+	cp.HyperpilotWriter = hpWriter
 	server.Writers[cp.Config.CustomerId] = hpWriter
 
 	return nil
@@ -169,9 +193,19 @@ func (server *Server) getCustomerProfile(token string) (*CustomerProfile, error)
 		if err := server.AuthDB.WriteMetrics("customer", customerConfig); err != nil {
 			return nil, errors.New("Unable write customer data to mongo:" + err.Error())
 		}
-		server.CustomerProfiles[customerId] = &CustomerProfile{
+
+		customerProfile := &CustomerProfile{
 			Config: customerConfig,
 		}
+
+		if err := buildClients(server.GlobInfluxdbConfig, customerProfile); err != nil {
+			return nil, fmt.Errorf("Unable to build customer clients %s: %s", customerId, err.Error())
+		}
+
+		if err := server.CreateHyperpilotWriter(customerProfile); err != nil {
+			return nil, fmt.Errorf("Unable tp create hyperpilot writer %s: %s", customerId, err.Error())
+		}
+		server.CustomerProfiles[customerId] = customerProfile
 	}
 
 	return customerProfile, nil
@@ -207,7 +241,7 @@ func (server *Server) write(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	samples := protoToSamples(&req, server.filterMetricPatterns)
+	samples := protoToSamples(&req, server.GlobInfluxdbConfig.FilterMetricPatterns)
 	receivedSamples.Add(float64(len(samples)))
 	customerProfile.HyperpilotWriter.Put(samples)
 }
@@ -294,11 +328,7 @@ func downloadConfigFile(url string) (*MetricsConfig, error) {
 	return &configs, nil
 }
 
-func buildClients(server *Server, cp *CustomerProfile, remoteTimeout time.Duration) error {
-	influxdbUsername := server.Config.GetString("influxdb.username")
-	influxdbPassword := server.Config.GetString("influxdb.password")
-	influxdbDatabase := server.Config.GetString("influxdb.database")
-	influxdbRetentionPolicy := server.Config.GetString("influxdb.retentionPolicy")
+func buildClients(influxCfg *GlobInfluxdbConfig, cp *CustomerProfile) error {
 	influxdbURL := cp.getInfluxdbURL()
 	if influxdbURL != "" {
 		url, err := url.Parse(influxdbURL)
@@ -307,19 +337,16 @@ func buildClients(server *Server, cp *CustomerProfile, remoteTimeout time.Durati
 		}
 		conf := influx.HTTPConfig{
 			Addr:     url.String(),
-			Username: influxdbUsername,
-			Password: influxdbPassword,
-			Timeout:  remoteTimeout,
+			Username: influxCfg.Username,
+			Password: influxCfg.Password,
+			Timeout:  influxCfg.RemoteTimeout,
 		}
-		c := influxdb.NewClient(conf, influxdbDatabase, influxdbRetentionPolicy)
+		c := influxdb.NewClient(conf, influxCfg.Database, influxCfg.RetentionPolicy)
 		prometheus.MustRegister(c)
 		cp.writer = c
 		cp.reader = c
-
-		if err := server.CreateWriter(cp); err != nil {
-			return fmt.Errorf("Unable to create writer {%s}: %s", cp.Config.CustomerId, err.Error())
-		}
 	}
+
 	return nil
 }
 
