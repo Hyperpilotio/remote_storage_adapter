@@ -25,14 +25,7 @@ func TestWriteMetrics(t *testing.T) {
 	customerConfig := &hpmodel.CustomerConfig{
 		Token:      "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
 		CustomerId: "hyperpilotio",
-		ClusterId:  "test",
-		InfluxdbClientConfig: hpmodel.InfluxdbClientConfig{
-			InfluxdbURL:             "localhost",
-			InfluxdbRetentionPolicy: "autogen",
-			InfluxdbUsername:        "root",
-			InfluxdbPassword:        "default",
-			InfluxdbDatabase:        "prometheus",
-		},
+		ClusterId:  "001",
 	}
 	if err := authdb.WriteMetrics("customer", customerConfig); err != nil {
 		t.Error("Unable write customer data to mongo")

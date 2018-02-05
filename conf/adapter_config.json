@@ -14,5 +14,11 @@
         "password": "hyperpilot",
         "configDatabase": "authdb",
         "customerCollection": "customers"
+    },
+    "influxdb": {
+        "username": "root",
+        "password": "default",
+        "database": "prometheus",
+        "retentionPolicy": "autogen"
     }
 }

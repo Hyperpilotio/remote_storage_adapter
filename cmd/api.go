@@ -31,8 +31,9 @@ import (
 
 // Server store the stats / data of every customerProfile
 type Server struct {
-	Config *viper.Viper
-	AuthDB *db.AuthDB
+	Config               *viper.Viper
+	AuthDB               *db.AuthDB
+	filterMetricPatterns []glob.Glob
 
 	customerProfileLock sync.RWMutex
 	CustomerProfiles    map[string]*CustomerProfile
@@ -85,8 +86,7 @@ func (server *Server) Init() error {
 
 	for _, customerCfg := range customers {
 		customerProfile := &CustomerProfile{
-			Config:               &customerCfg,
-			filterMetricPatterns: filterMetricPatterns,
+			Config: &customerCfg,
 		}
 
 		if err := buildClients(server, customerProfile, remoteTimeout); err != nil {
@@ -137,11 +137,17 @@ type reader interface {
 }
 
 type CustomerProfile struct {
-	Config               *hpmodel.CustomerConfig
-	writer               writer
-	reader               reader
-	filterMetricPatterns []glob.Glob
-	HyperpilotWriter     *HyperpilotWriter
+	Config           *hpmodel.CustomerConfig
+	writer           writer
+	reader           reader
+	HyperpilotWriter *HyperpilotWriter
+}
+
+func (cp *CustomerProfile) getInfluxdbURL() string {
+	// TODO: We assume influxdbURL is influxsrv+clusterId
+	serviceName := "influxsrv"
+	namespace := "hyperpilot"
+	return fmt.Sprintf("http://%s-%s.%s:8086", serviceName, cp.Config.ClusterId, namespace)
 }
 
 func (server *Server) getCustomerProfile(token string) (*CustomerProfile, error) {
@@ -151,10 +157,21 @@ func (server *Server) getCustomerProfile(token string) (*CustomerProfile, error)
 	// TODO: decode token and get customerId
 	// We assume customerId is hyperpilotio
 	customerId := "hyperpilotio"
+	clusterId := "001"
 
 	customerProfile, ok := server.CustomerProfiles[customerId]
 	if !ok {
-		return nil, errors.New("Unable to find CustomerProfile")
+		customerConfig := &hpmodel.CustomerConfig{
+			Token:      token,
+			CustomerId: customerId,
+			ClusterId:  clusterId,
+		}
+		if err := server.AuthDB.WriteMetrics("customer", customerConfig); err != nil {
+			return nil, errors.New("Unable write customer data to mongo:" + err.Error())
+		}
+		server.CustomerProfiles[customerId] = &CustomerProfile{
+			Config: customerConfig,
+		}
 	}
 
 	return customerProfile, nil
@@ -190,7 +207,7 @@ func (server *Server) write(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	samples := protoToSamples(&req, customerProfile.filterMetricPatterns)
+	samples := protoToSamples(&req, server.filterMetricPatterns)
 	receivedSamples.Add(float64(len(samples)))
 	customerProfile.HyperpilotWriter.Put(samples)
 }
@@ -278,22 +295,23 @@ func downloadConfigFile(url string) (*MetricsConfig, error) {
 }
 
 func buildClients(server *Server, cp *CustomerProfile, remoteTimeout time.Duration) error {
-	if cp.Config.InfluxdbURL != "" {
-		url, err := url.Parse(cp.Config.InfluxdbURL)
+	influxdbUsername := server.Config.GetString("influxdb.username")
+	influxdbPassword := server.Config.GetString("influxdb.password")
+	influxdbDatabase := server.Config.GetString("influxdb.database")
+	influxdbRetentionPolicy := server.Config.GetString("influxdb.retentionPolicy")
+	influxdbURL := cp.getInfluxdbURL()
+	if influxdbURL != "" {
+		url, err := url.Parse(influxdbURL)
 		if err != nil {
-			return fmt.Errorf("Failed to parse InfluxDB URL %s: %s", cp.Config.InfluxdbURL, err.Error())
+			return fmt.Errorf("Failed to parse InfluxDB URL %s: %s", influxdbURL, err.Error())
 		}
 		conf := influx.HTTPConfig{
 			Addr:     url.String(),
-			Username: cp.Config.InfluxdbUsername,
-			Password: cp.Config.InfluxdbPassword,
+			Username: influxdbUsername,
+			Password: influxdbPassword,
 			Timeout:  remoteTimeout,
 		}
-		c := influxdb.NewClient(
-			conf,
-			cp.Config.InfluxdbDatabase,
-			cp.Config.InfluxdbRetentionPolicy,
-		)
+		c := influxdb.NewClient(conf, influxdbDatabase, influxdbRetentionPolicy)
 		prometheus.MustRegister(c)
 		cp.writer = c
 		cp.reader = c
