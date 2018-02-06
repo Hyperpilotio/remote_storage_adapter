@@ -34,6 +34,7 @@ type Client struct {
 	client          influx.Client
 	database        string
 	retentionPolicy string
+	name            string
 	ignoredSamples  prometheus.Counter
 }
 
@@ -54,6 +55,7 @@ func NewClient(conf influx.HTTPConfig, db string, rp string) *Client {
 		client:          c,
 		database:        db,
 		retentionPolicy: rp,
+		name:            "influxsrv-" + strings.Split(conf.Addr, "-")[1],
 		ignoredSamples: prometheus.NewCounter(
 			prometheus.CounterOpts{
 				Name: "prometheus_influxdb_ignored_samples_total",
@@ -108,6 +110,7 @@ func (c *Client) Write(samples model.Samples) error {
 		return err
 	}
 	bps.AddPoints(points)
+	log.Infof("%s write points into %s db", c.Name(), c.database)
 	return c.client.Write(bps)
 }
 
@@ -308,7 +311,7 @@ func mergeSamples(a, b []*prompb.Sample) []*prompb.Sample {
 
 // Name identifies the client as an InfluxDB client.
 func (c Client) Name() string {
-	return "influxdb"
+	return c.name
 }
 
 // Describe implements prometheus.Collector.

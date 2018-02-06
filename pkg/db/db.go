@@ -4,7 +4,7 @@ import (
 	"errors"
 	"fmt"
 
-	mgo "gopkg.in/mgo.v2"
+	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 
 	"github.com/hyperpilotio/remote_storage_adapter/pkg/common/model"
@@ -58,6 +58,24 @@ func (authDB *AuthDB) GetCustomers() ([]model.CustomerConfig, error) {
 	}
 
 	return customers, nil
+}
+
+func (authDB *AuthDB) GetOneCustomerByToken(token string) (*model.CustomerConfig, error) {
+	session, sessionErr := connectMongo(authDB.Url, authDB.Database, authDB.User, authDB.Password)
+	if sessionErr != nil {
+		return nil, errors.New("Unable to create mongo session: " + sessionErr.Error())
+	}
+	defer session.Close()
+
+	var customers model.CustomerConfig
+	collection := session.DB(authDB.Database).C(authDB.CustomerCollection)
+
+	if err := collection.Find(bson.M{"token": token}).One(&customers); err != nil {
+		return nil, errors.New(
+			fmt.Sprintf("Unable to read customers with token %s from auth db: %s", token, err.Error()))
+	}
+
+	return &customers, nil
 }
 
 func (authDB *AuthDB) getCollection(dataType string) (string, error) {
