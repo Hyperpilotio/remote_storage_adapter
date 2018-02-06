@@ -99,7 +99,7 @@ func (server *Server) Init() error {
 		customerProfile := &CustomerProfile{
 			Config: &customerCfg,
 		}
-		if err := buildClients(&customerCfg, server.GlobInfluxdbConfig, customerProfile); err != nil {
+		if err := buildClients(server.GlobInfluxdbConfig, customerProfile); err != nil {
 			return fmt.Errorf("Unable to build customer clients %s: %s", customerCfg.CustomerId, err.Error())
 		}
 
@@ -169,28 +169,24 @@ func (server *Server) getCustomerProfile(token, clusterId, customerId string) (*
 		return customerProfile, nil
 	}
 
-	customerProfile = &CustomerProfile{
-		Config: &hpmodel.CustomerConfig{
-			Token:      token,
-			CustomerId: customerId,
-			ClusterId:  clusterId,
-		},
-	}
-
 	customerConfig, err := server.AuthDB.GetOneCustomerByToken(token)
 	if err != nil {
 		log.Error(err.Error())
 		return nil, err
 	}
 
-	if err := buildClients(customerConfig, server.GlobInfluxdbConfig, customerProfile); err != nil {
+	customerProfile = &CustomerProfile{
+		Config: customerConfig,
+	}
+
+	if err := buildClients(server.GlobInfluxdbConfig, customerProfile); err != nil {
 		return nil, fmt.Errorf("Unable to build customer clients %s: %s", customerId, err.Error())
 	}
 
 	if err := server.CreateHyperpilotWriter(customerProfile); err != nil {
 		return nil, fmt.Errorf("Unable tp create hyperpilot writer %s: %s", customerId, err.Error())
 	}
-	server.CustomerProfiles[customerId] = customerProfile
+	server.CustomerProfiles[customerConfig.CustomerId] = customerProfile
 	return customerProfile, nil
 }
 
@@ -315,22 +311,25 @@ func downloadConfigFile(url string) (*MetricsConfig, error) {
 	return &configs, nil
 }
 
-func buildClients(customerConfig *hpmodel.CustomerConfig, globalInfluxConfig *GlobInfluxdbConfig, cp *CustomerProfile) error {
-	influxdbURL := customerConfig.InfluxdbURL
+func buildClients(globalInfluxConfig *GlobInfluxdbConfig, cp *CustomerProfile) error {
+	influxdbURL := cp.Config.InfluxdbURL
 	if influxdbURL != "" {
-		log.Infof("create influx for Customer ID {%s} with influx url {%s}", customerConfig.CustomerId, customerConfig.InfluxdbURL)
+		log.Infof("create influx for Customer ID {%s} with influx url {%s}", cp.Config.CustomerId, influxdbURL)
 		url, err := url.Parse(influxdbURL)
 		if err != nil {
 			return fmt.Errorf("Failed to parse InfluxDB URL %s: %s", influxdbURL, err.Error())
 		}
 		conf := influx.HTTPConfig{
 			Addr:     url.String(),
-			Username: customerConfig.InfluxdbUsername,
-			Password: customerConfig.InfluxdbPassword,
+			Username: cp.Config.InfluxdbUsername,
+			Password: cp.Config.InfluxdbPassword,
 			Timeout:  globalInfluxConfig.RemoteTimeout,
 		}
-		c := influxdb.NewClient(conf, customerConfig.InfluxdbDatabase, customerConfig.InfluxdbRetentionPolicy)
-		prometheus.MustRegister(c)
+		c := influxdb.NewClient(conf, cp.Config.InfluxdbDatabase, cp.Config.InfluxdbRetentionPolicy)
+
+		reg := prometheus.NewPedanticRegistry()
+		reg.MustRegister(c)
+
 		cp.writer = c
 		cp.reader = c
 	}
