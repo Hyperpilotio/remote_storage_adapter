@@ -55,7 +55,7 @@ func NewClient(conf influx.HTTPConfig, db string, rp string) *Client {
 		client:          c,
 		database:        db,
 		retentionPolicy: rp,
-		name:            "influxsrv-" + strings.Split(conf.Addr, "-")[1],
+		name:            conf.Addr,
 		ignoredSamples: prometheus.NewCounter(
 			prometheus.CounterOpts{
 				Name: "prometheus_influxdb_ignored_samples_total",
