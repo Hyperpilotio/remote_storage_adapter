@@ -30,10 +30,6 @@ import (
 )
 
 type GlobInfluxdbConfig struct {
-	Username             string
-	Password             string
-	Database             string
-	RetentionPolicy      string
 	RemoteTimeout        time.Duration
 	FilterMetricPatterns []glob.Glob
 }
@@ -60,11 +56,8 @@ func NewServer(cfg *viper.Viper) *Server {
 	return &Server{
 		Config: cfg,
 		AuthDB: db.NewAuthDB(cfg),
+
 		GlobInfluxdbConfig: &GlobInfluxdbConfig{
-			Username:             cfg.GetString("influxdb.username"),
-			Password:             cfg.GetString("influxdb.password"),
-			Database:             cfg.GetString("influxdb.database"),
-			RetentionPolicy:      cfg.GetString("influxdb.retentionPolicy"),
 			FilterMetricPatterns: make([]glob.Glob, 0),
 		},
 		CustomerProfiles: make(map[string]*CustomerProfile),
@@ -101,11 +94,11 @@ func (server *Server) Init() error {
 	if err != nil {
 		return errors.New("Unable to get customers config: %s" + err.Error())
 	}
+	log.Infof("Shared Mongo has %d customer cluster, create inlfux client for each client cluster", len(customers))
 	for _, customerCfg := range customers {
 		customerProfile := &CustomerProfile{
 			Config: &customerCfg,
 		}
-
 		if err := buildClients(server.GlobInfluxdbConfig, customerProfile); err != nil {
 			return fmt.Errorf("Unable to build customer clients %s: %s", customerCfg.CustomerId, err.Error())
 		}
@@ -167,36 +160,23 @@ type CustomerProfile struct {
 	HyperpilotWriter *HyperpilotWriter
 }
 
-func (cp *CustomerProfile) getInfluxdbURL() string {
-	// TODO: We assume influxdbURL is influxsrv+clusterId
-	serviceName := "influxsrv"
-	namespace := "hyperpilot"
-	return fmt.Sprintf("http://%s-%s.%s:8086", serviceName, cp.Config.ClusterId, namespace)
-}
-
-func (server *Server) getCustomerProfile(token string) (*CustomerProfile, error) {
+func (server *Server) getCustomerProfile(token, clusterId, customerId string) (*CustomerProfile, error) {
 	server.customerProfileLock.RLock()
 	defer server.customerProfileLock.RUnlock()
-
-	// TODO: decode token and get customerId
-	// We assume customerId is hyperpilotio
-	customerId := "hyperpilotio"
-	clusterId := "001"
 
 	customerProfile, ok := server.CustomerProfiles[customerId]
 	if ok {
 		return customerProfile, nil
 	}
 
-	customerProfile = &CustomerProfile{
-		Config: &hpmodel.CustomerConfig{
-			Token:      token,
-			CustomerId: customerId,
-			ClusterId:  clusterId,
-		},
+	customerConfig, err := server.AuthDB.GetOneCustomerByToken(token)
+	if err != nil {
+		log.Error(err.Error())
+		return nil, err
 	}
-	if err := server.AuthDB.WriteMetrics("customer", customerProfile.Config); err != nil {
-		return nil, errors.New("Unable write customer data to mongo:" + err.Error())
+
+	customerProfile = &CustomerProfile{
+		Config: customerConfig,
 	}
 
 	if err := buildClients(server.GlobInfluxdbConfig, customerProfile); err != nil {
@@ -206,13 +186,15 @@ func (server *Server) getCustomerProfile(token string) (*CustomerProfile, error)
 	if err := server.CreateHyperpilotWriter(customerProfile); err != nil {
 		return nil, fmt.Errorf("Unable tp create hyperpilot writer %s: %s", customerId, err.Error())
 	}
-	server.CustomerProfiles[customerId] = customerProfile
+	server.CustomerProfiles[customerConfig.CustomerId] = customerProfile
 	return customerProfile, nil
 }
 
 func (server *Server) write(w http.ResponseWriter, r *http.Request) {
 	token := r.FormValue("token")
-	customerProfile, err := server.getCustomerProfile(token)
+	clutserId := r.FormValue("clusterId")
+	customerId := r.FormValue("customerId")
+	customerProfile, err := server.getCustomerProfile(token, clutserId, customerId)
 	if err != nil {
 		log.Errorf("CustomerProfile not found: %s", err.Error())
 		http.Error(w, "CustomerProfile not found", http.StatusInternalServerError)
@@ -247,7 +229,9 @@ func (server *Server) write(w http.ResponseWriter, r *http.Request) {
 
 func (server *Server) read(w http.ResponseWriter, r *http.Request) {
 	token := r.FormValue("token")
-	customerProfile, err := server.getCustomerProfile(token)
+	clutserId := r.FormValue("clusterId")
+	customerId := r.FormValue("customerId")
+	customerProfile, err := server.getCustomerProfile(token, clutserId, customerId)
 	if err != nil {
 		log.Errorf("CustomerProfile not found: %s", err.Error())
 		http.Error(w, "CustomerProfile not found", http.StatusInternalServerError)
@@ -327,21 +311,25 @@ func downloadConfigFile(url string) (*MetricsConfig, error) {
 	return &configs, nil
 }
 
-func buildClients(influxCfg *GlobInfluxdbConfig, cp *CustomerProfile) error {
-	influxdbURL := cp.getInfluxdbURL()
+func buildClients(globalInfluxConfig *GlobInfluxdbConfig, cp *CustomerProfile) error {
+	influxdbURL := cp.Config.InfluxdbURL
 	if influxdbURL != "" {
+		log.Infof("create influx for Customer ID {%s} with influx url {%s}", cp.Config.CustomerId, influxdbURL)
 		url, err := url.Parse(influxdbURL)
 		if err != nil {
 			return fmt.Errorf("Failed to parse InfluxDB URL %s: %s", influxdbURL, err.Error())
 		}
 		conf := influx.HTTPConfig{
 			Addr:     url.String(),
-			Username: influxCfg.Username,
-			Password: influxCfg.Password,
-			Timeout:  influxCfg.RemoteTimeout,
+			Username: cp.Config.InfluxdbUsername,
+			Password: cp.Config.InfluxdbPassword,
+			Timeout:  globalInfluxConfig.RemoteTimeout,
 		}
-		c := influxdb.NewClient(conf, influxCfg.Database, influxCfg.RetentionPolicy)
-		prometheus.MustRegister(c)
+		c := influxdb.NewClient(conf, cp.Config.InfluxdbDatabase, cp.Config.InfluxdbRetentionPolicy)
+
+		reg := prometheus.NewPedanticRegistry()
+		reg.MustRegister(c)
+
 		cp.writer = c
 		cp.reader = c
 	}
