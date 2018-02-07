@@ -64,7 +64,7 @@ func NewServer(cfg *viper.Viper) *Server {
 		InfluxdbConfig: &InfluxdbConfig{
 			FilterMetricPatterns: make([]glob.Glob, 0),
 			Username:             "root", // TODO: Make this configurable
-			Password:             "root",
+			Password:             "default",
 			Database:             "prometheus",
 			RetentionPolicy:      "autogen",
 		},
@@ -168,18 +168,18 @@ type CustomerProfile struct {
 	HyperpilotWriter *HyperpilotWriter
 }
 
-func (server *Server) getCustomerProfile(token, clusterId, customerId string) (*CustomerProfile, error) {
+func (server *Server) getCustomerProfile(token, clusterId, orgId string) (*CustomerProfile, error) {
 	server.customerProfileLock.RLock()
 	defer server.customerProfileLock.RUnlock()
 
-	customerProfile, ok := server.CustomerProfiles[customerId]
+	customerProfile, ok := server.CustomerProfiles[orgId]
 	if ok {
 		return customerProfile, nil
 	}
 
 	customerConfig, err := server.AuthDB.FindOrgByToken(token)
 	if err != nil {
-		log.Error(err.Error())
+		log.Errorf("Unable to find organizations by token {%s}: %s", token, err.Error())
 		return nil, err
 	}
 
@@ -188,11 +188,11 @@ func (server *Server) getCustomerProfile(token, clusterId, customerId string) (*
 	}
 
 	if err := buildClients(server.InfluxdbConfig, customerProfile); err != nil {
-		return nil, fmt.Errorf("Unable to build customer clients %s: %s", customerId, err.Error())
+		return nil, fmt.Errorf("Unable to build customer clients %s: %s", orgId, err.Error())
 	}
 
 	if err := server.CreateHyperpilotWriter(customerProfile); err != nil {
-		return nil, fmt.Errorf("Unable tp create hyperpilot writer %s: %s", customerId, err.Error())
+		return nil, fmt.Errorf("Unable tp create hyperpilot writer %s: %s", orgId, err.Error())
 	}
 	server.CustomerProfiles[customerConfig.OrgId] = customerProfile
 	return customerProfile, nil
@@ -201,8 +201,15 @@ func (server *Server) getCustomerProfile(token, clusterId, customerId string) (*
 func (server *Server) write(w http.ResponseWriter, r *http.Request) {
 	token := r.FormValue("token")
 	clutserId := r.FormValue("clusterId")
-	customerId := r.FormValue("customerId")
-	customerProfile, err := server.getCustomerProfile(token, clutserId, customerId)
+	orgId := r.FormValue("orgId")
+
+	if token == "" || clutserId == "" || orgId == "" {
+		log.Errorf("token or clusterId or orgId is not available in URL")
+		http.Error(w, "token or clusterId or orgId is not available in URL", http.StatusInternalServerError)
+		return
+	}
+
+	customerProfile, err := server.getCustomerProfile(token, clutserId, orgId)
 	if err != nil {
 		log.Errorf("CustomerProfile not found: %s", err.Error())
 		http.Error(w, "CustomerProfile not found", http.StatusInternalServerError)
@@ -238,8 +245,15 @@ func (server *Server) write(w http.ResponseWriter, r *http.Request) {
 func (server *Server) read(w http.ResponseWriter, r *http.Request) {
 	token := r.FormValue("token")
 	clutserId := r.FormValue("clusterId")
-	customerId := r.FormValue("customerId")
-	customerProfile, err := server.getCustomerProfile(token, clutserId, customerId)
+	orgId := r.FormValue("orgId")
+
+	if token == "" || clutserId == "" || orgId == "" {
+		log.Errorf("token or clusterId or orgId is not available in URL")
+		http.Error(w, "token or clusterId or orgId is not available in URL", http.StatusInternalServerError)
+		return
+	}
+
+	customerProfile, err := server.getCustomerProfile(token, clutserId, orgId)
 	if err != nil {
 		log.Errorf("CustomerProfile not found: %s", err.Error())
 		http.Error(w, "CustomerProfile not found", http.StatusInternalServerError)

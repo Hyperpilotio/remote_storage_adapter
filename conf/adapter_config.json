@@ -13,6 +13,6 @@
         "user": "analyzer",
         "password": "hyperpilot",
         "configDatabase": "authdb",
-        "customerCollection": "customers"
+        "organizationsCollection": "organizations"
     }
 }

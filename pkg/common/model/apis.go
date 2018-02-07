@@ -7,5 +7,5 @@ type Organization struct {
 }
 
 func (org *Organization) InfluxUrl() string {
-	return "http://influxdb-" + org.OrgId + ":8086"
+	return "http://influxsrv." + org.ClusterId + ":8086"
 }
