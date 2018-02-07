@@ -12,20 +12,20 @@ import (
 )
 
 type AuthDB struct {
-	Url                string
-	User               string
-	Password           string
-	Database           string
-	CustomerCollection string
+	Url                     string
+	User                    string
+	Password                string
+	Database                string
+	OrganizationsCollection string
 }
 
 func NewAuthDB(config *viper.Viper) *AuthDB {
 	return &AuthDB{
-		Url:                config.GetString("database.url"),
-		User:               config.GetString("database.user"),
-		Password:           config.GetString("database.password"),
-		Database:           config.GetString("database.configDatabase"),
-		CustomerCollection: config.GetString("database.customerCollection"),
+		Url:                     config.GetString("database.url"),
+		User:                    config.GetString("database.user"),
+		Password:                config.GetString("database.password"),
+		Database:                config.GetString("database.configDatabase"),
+		OrganizationsCollection: config.GetString("database.organizationsCollection"),
 	}
 }
 
@@ -44,44 +44,44 @@ func connectMongo(url string, database string, user string, password string) (*m
 	return session, nil
 }
 
-func (authDB *AuthDB) GetCustomers() ([]model.CustomerConfig, error) {
+func (authDB *AuthDB) GetOrganizations() ([]model.Organization, error) {
 	session, sessionErr := connectMongo(authDB.Url, authDB.Database, authDB.User, authDB.Password)
 	if sessionErr != nil {
 		return nil, errors.New("Unable to create mongo session: " + sessionErr.Error())
 	}
 	defer session.Close()
 
-	var customers []model.CustomerConfig
-	collection := session.DB(authDB.Database).C(authDB.CustomerCollection)
-	if err := collection.Find(nil).All(&customers); err != nil {
-		return nil, errors.New("Unable to read customers from auth db: " + err.Error())
+	var organizations []model.Organization
+	collection := session.DB(authDB.Database).C(authDB.OrganizationsCollection)
+	if err := collection.Find(nil).All(&organizations); err != nil {
+		return nil, errors.New("Unable to read organizations from auth db: " + err.Error())
 	}
 
-	return customers, nil
+	return organizations, nil
 }
 
-func (authDB *AuthDB) GetOneCustomerByToken(token string) (*model.CustomerConfig, error) {
+func (authDB *AuthDB) FindOrgByToken(token string) (*model.Organization, error) {
 	session, sessionErr := connectMongo(authDB.Url, authDB.Database, authDB.User, authDB.Password)
 	if sessionErr != nil {
 		return nil, errors.New("Unable to create mongo session: " + sessionErr.Error())
 	}
 	defer session.Close()
 
-	var customers model.CustomerConfig
-	collection := session.DB(authDB.Database).C(authDB.CustomerCollection)
+	var organization model.Organization
+	collection := session.DB(authDB.Database).C(authDB.OrganizationsCollection)
 
-	if err := collection.Find(bson.M{"token": token}).One(&customers); err != nil {
+	if err := collection.Find(bson.M{"token": token}).One(&organization); err != nil {
 		return nil, errors.New(
-			fmt.Sprintf("Unable to read customers with token %s from auth db: %s", token, err.Error()))
+			fmt.Sprintf("Unable to find organization with token %s from auth db: %s", token, err.Error()))
 	}
 
-	return &customers, nil
+	return &organization, nil
 }
 
 func (authDB *AuthDB) getCollection(dataType string) (string, error) {
 	switch dataType {
-	case "customer":
-		return authDB.CustomerCollection, nil
+	case "organization":
+		return authDB.OrganizationsCollection, nil
 	default:
 		return "", errors.New("Unable to find collection for: " + dataType)
 	}

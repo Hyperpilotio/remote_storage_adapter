@@ -17,7 +17,7 @@ func init() {
 	config.Set("database.user", "analyzer")
 	config.Set("database.password", "hyperpilot")
 	config.Set("database.configDatabase", "authdb")
-	config.Set("database.customerCollection", "customers")
+	config.Set("database.organizationsCollection", "organizations")
 	authdb = NewAuthDB(config)
 }
 
@@ -27,14 +27,14 @@ func TestWriteMetrics(t *testing.T) {
 		CustomerId: "hyperpilotio",
 		ClusterId:  "001",
 	}
-	if err := authdb.WriteMetrics("customer", customerConfig); err != nil {
+	if err := authdb.WriteMetrics("organization", customerConfig); err != nil {
 		t.Error("Unable write customer data to mongo")
 	}
 }
 
 func TestGetCustomers(t *testing.T) {
-	_, err := authdb.GetCustomers()
+	_, err := authdb.GetOrganizations()
 	if err != nil {
-		t.Error("Unable get customers from mongo")
+		t.Error("Unable get organizations from mongo")
 	}
 }
