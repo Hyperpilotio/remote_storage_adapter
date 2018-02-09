@@ -43,6 +43,7 @@ type Server struct {
 	Config         *viper.Viper
 	AuthDB         *db.AuthDB
 	InfluxdbConfig *InfluxdbConfig
+	MetricCatalog  *hpmodel.MetricCatalog
 
 	customerProfileLock sync.RWMutex
 	CustomerProfiles    map[string]*CustomerProfile
@@ -60,13 +61,15 @@ func NewServer(cfg *viper.Viper) *Server {
 	return &Server{
 		Config: cfg,
 		AuthDB: db.NewAuthDB(cfg),
-
 		InfluxdbConfig: &InfluxdbConfig{
 			FilterMetricPatterns: make([]glob.Glob, 0),
 			Username:             "root", // TODO: Make this configurable
 			Password:             "default",
 			Database:             "prometheus",
 			RetentionPolicy:      "autogen",
+		},
+		MetricCatalog: &hpmodel.MetricCatalog{
+			Keys: make([]string, 0),
 		},
 		CustomerProfiles: make(map[string]*CustomerProfile),
 		Writers:          make(map[string]*HyperpilotWriter),
@@ -125,6 +128,7 @@ func (server *Server) StartServer() error {
 	http.Handle(server.Config.GetString("telemetryPath"), prometheus.Handler())
 	http.HandleFunc("/write", server.write)
 	http.HandleFunc("/read", server.read)
+	http.HandleFunc("/namespaces", server.namespaces)
 	return http.ListenAndServe(":"+server.Config.GetString("listenAddr"), nil)
 }
 
@@ -237,7 +241,7 @@ func (server *Server) write(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	samples := protoToSamples(&req, server.InfluxdbConfig.FilterMetricPatterns)
+	samples := protoToSamples(&req, server.InfluxdbConfig.FilterMetricPatterns, server.MetricCatalog)
 	receivedSamples.Add(float64(len(samples)))
 	customerProfile.HyperpilotWriter.Put(samples)
 }
@@ -309,6 +313,17 @@ func (server *Server) read(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (server *Server) namespaces(w http.ResponseWriter, r *http.Request) {
+	ms, err := json.Marshal(server.MetricCatalog)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(ms)
+}
+
 type metricInfo struct {
 	Version_ int `json:"version":"version"`
 }
@@ -357,7 +372,10 @@ func buildClients(influxConfig *InfluxdbConfig, cp *CustomerProfile) error {
 	return nil
 }
 
-func protoToSamples(req *prompb.WriteRequest, filterMetricPatterns []glob.Glob) model.Samples {
+func protoToSamples(
+	req *prompb.WriteRequest,
+	filterMetricPatterns []glob.Glob,
+	metricCatalog *hpmodel.MetricCatalog) model.Samples {
 	var samples model.Samples
 	for _, ts := range req.Timeseries {
 		metric := make(model.Metric, len(ts.Labels))
@@ -366,6 +384,7 @@ func protoToSamples(req *prompb.WriteRequest, filterMetricPatterns []glob.Glob) 
 		}
 
 		metricName := metric[model.MetricNameLabel]
+		metricCatalog.Add(string(metricName))
 		for _, s := range ts.Samples {
 			isAppendMetric := false
 			if len(filterMetricPatterns) == 0 {
