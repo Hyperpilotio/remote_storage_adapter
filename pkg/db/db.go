@@ -12,20 +12,22 @@ import (
 )
 
 type AuthDB struct {
-	Url                     string
-	User                    string
-	Password                string
-	Database                string
-	OrganizationsCollection string
+	Url                      string
+	User                     string
+	Password                 string
+	Database                 string
+	OrganizationsCollection  string
+	ClusterMetricsCollection string
 }
 
 func NewAuthDB(config *viper.Viper) *AuthDB {
 	return &AuthDB{
-		Url:                     config.GetString("database.url"),
-		User:                    config.GetString("database.user"),
-		Password:                config.GetString("database.password"),
-		Database:                config.GetString("database.configDatabase"),
-		OrganizationsCollection: config.GetString("database.organizationsCollection"),
+		Url:                      config.GetString("database.url"),
+		User:                     config.GetString("database.user"),
+		Password:                 config.GetString("database.password"),
+		Database:                 config.GetString("database.configDatabase"),
+		OrganizationsCollection:  config.GetString("database.organizationsCollection"),
+		ClusterMetricsCollection: config.GetString("database.clusterMetricsCollection"),
 	}
 }
 
@@ -80,8 +82,10 @@ func (authDB *AuthDB) FindOrgByToken(token string) (*model.Organization, error) 
 
 func (authDB *AuthDB) getCollection(dataType string) (string, error) {
 	switch dataType {
-	case "organization":
+	case "organizations":
 		return authDB.OrganizationsCollection, nil
+	case "clustermetrics":
+		return authDB.ClusterMetricsCollection, nil
 	default:
 		return "", errors.New("Unable to find collection for: " + dataType)
 	}
@@ -108,7 +112,7 @@ func (authDB *AuthDB) WriteMetrics(dataType string, obj interface{}) error {
 	return nil
 }
 
-func (authDB *AuthDB) UpsertMetrics(dataType string, appName string, obj interface{}) error {
+func (authDB *AuthDB) UpsertMetrics(dataType string, selector interface{}, obj interface{}) error {
 	collectionName, collectionErr := authDB.getCollection(dataType)
 	if collectionErr != nil {
 		return collectionErr
@@ -122,7 +126,7 @@ func (authDB *AuthDB) UpsertMetrics(dataType string, appName string, obj interfa
 	defer session.Close()
 
 	collection := session.DB(authDB.Database).C(collectionName)
-	if _, err := collection.Upsert(bson.M{"appName": appName}, obj); err != nil {
+	if _, err := collection.Upsert(selector, obj); err != nil {
 		return fmt.Errorf("Unable to upsert %s into metrics db: %s", dataType, err.Error())
 	}
 
