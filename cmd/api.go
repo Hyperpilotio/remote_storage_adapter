@@ -19,6 +19,7 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/spf13/viper"
+	"gopkg.in/mgo.v2/bson"
 
 	influx "github.com/influxdata/influxdb/client/v2"
 	log "github.com/sirupsen/logrus"
@@ -43,7 +44,6 @@ type Server struct {
 	Config         *viper.Viper
 	AuthDB         *db.AuthDB
 	InfluxdbConfig *InfluxdbConfig
-	MetricCatalog  *hpmodel.MetricCatalog
 
 	customerProfileLock sync.RWMutex
 	CustomerProfiles    map[string]*CustomerProfile
@@ -67,9 +67,6 @@ func NewServer(cfg *viper.Viper) *Server {
 			Password:             "default",
 			Database:             "prometheus",
 			RetentionPolicy:      "autogen",
-		},
-		MetricCatalog: &hpmodel.MetricCatalog{
-			Keys: make([]string, 0),
 		},
 		CustomerProfiles: make(map[string]*CustomerProfile),
 		Writers:          make(map[string]*HyperpilotWriter),
@@ -109,6 +106,10 @@ func (server *Server) Init() error {
 	for _, customerCfg := range customers {
 		customerProfile := &CustomerProfile{
 			Config: &customerCfg,
+			ClusterMetrics: &hpmodel.ClusterMetrics{
+				ClusterId: customerCfg.ClusterId,
+				Keys:      make([]string, 0),
+			},
 		}
 		if err := buildClients(server.InfluxdbConfig, customerProfile); err != nil {
 			return fmt.Errorf("Unable to build customer clients %s: %s", customerCfg.OrgId, err.Error())
@@ -120,6 +121,13 @@ func (server *Server) Init() error {
 		server.CustomerProfiles[customerCfg.OrgId] = customerProfile
 	}
 
+	go func() {
+		for {
+			server.updateClusterMetricNamepaces()
+			time.Sleep(30 * time.Second)
+		}
+	}()
+
 	return nil
 }
 
@@ -128,7 +136,6 @@ func (server *Server) StartServer() error {
 	http.Handle(server.Config.GetString("telemetryPath"), prometheus.Handler())
 	http.HandleFunc("/write", server.write)
 	http.HandleFunc("/read", server.read)
-	http.HandleFunc("/namespaces", server.namespaces)
 	return http.ListenAndServe(":"+server.Config.GetString("listenAddr"), nil)
 }
 
@@ -167,6 +174,7 @@ type reader interface {
 
 type CustomerProfile struct {
 	Config           *hpmodel.Organization
+	ClusterMetrics   *hpmodel.ClusterMetrics
 	writer           writer
 	reader           reader
 	HyperpilotWriter *HyperpilotWriter
@@ -189,6 +197,10 @@ func (server *Server) getCustomerProfile(token, clusterId, orgId string) (*Custo
 
 	customerProfile = &CustomerProfile{
 		Config: customerConfig,
+		ClusterMetrics: &hpmodel.ClusterMetrics{
+			ClusterId: customerConfig.ClusterId,
+			Keys:      make([]string, 0),
+		},
 	}
 
 	if err := buildClients(server.InfluxdbConfig, customerProfile); err != nil {
@@ -241,7 +253,7 @@ func (server *Server) write(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	samples := protoToSamples(&req, server.InfluxdbConfig.FilterMetricPatterns, server.MetricCatalog)
+	samples := protoToSamples(&req, server.InfluxdbConfig.FilterMetricPatterns, customerProfile.ClusterMetrics)
 	receivedSamples.Add(float64(len(samples)))
 	customerProfile.HyperpilotWriter.Put(samples)
 }
@@ -313,15 +325,30 @@ func (server *Server) read(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (server *Server) namespaces(w http.ResponseWriter, r *http.Request) {
-	ms, err := json.Marshal(server.MetricCatalog)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+func (server *Server) updateClusterMetricNamepaces() {
+	server.customerProfileLock.RLock()
+	defer server.customerProfileLock.RUnlock()
 
-	w.Header().Set("Content-Type", "application/json")
-	w.Write(ms)
+	for _, cp := range server.CustomerProfiles {
+		nowClusterMetricSize := len(cp.ClusterMetrics.Keys)
+		if nowClusterMetricSize > 0 && cp.ClusterMetrics.Size == 0 {
+			cp.ClusterMetrics.Size = nowClusterMetricSize
+			server.AuthDB.WriteMetrics(
+				"clustermetrics",
+				cp.ClusterMetrics,
+			)
+			continue
+		}
+
+		if nowClusterMetricSize > cp.ClusterMetrics.Size {
+			cp.ClusterMetrics.Size = nowClusterMetricSize
+			server.AuthDB.UpsertMetrics(
+				"clustermetrics",
+				bson.M{"clusterId": cp.ClusterMetrics.ClusterId},
+				cp.ClusterMetrics,
+			)
+		}
+	}
 }
 
 type metricInfo struct {
@@ -375,7 +402,7 @@ func buildClients(influxConfig *InfluxdbConfig, cp *CustomerProfile) error {
 func protoToSamples(
 	req *prompb.WriteRequest,
 	filterMetricPatterns []glob.Glob,
-	metricCatalog *hpmodel.MetricCatalog) model.Samples {
+	cm *hpmodel.ClusterMetrics) model.Samples {
 	var samples model.Samples
 	for _, ts := range req.Timeseries {
 		metric := make(model.Metric, len(ts.Labels))
@@ -384,7 +411,7 @@ func protoToSamples(
 		}
 
 		metricName := metric[model.MetricNameLabel]
-		metricCatalog.Add(string(metricName))
+		cm.Add(string(metricName))
 		for _, s := range ts.Samples {
 			isAppendMetric := false
 			if len(filterMetricPatterns) == 0 {
