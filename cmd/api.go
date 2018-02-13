@@ -121,12 +121,19 @@ func (server *Server) Init() error {
 		server.CustomerProfiles[customerCfg.OrgId] = customerProfile
 	}
 
-	go func() {
-		for {
-			server.updateClusterMetricNamepaces()
-			time.Sleep(30 * time.Second)
+	if server.Config.GetBool("clusterMetric.writeMongo") {
+		checkInterval, err := time.ParseDuration(server.Config.GetString("clusterMetric.interval"))
+		if err != nil {
+			return errors.New("Unable to parse cluster metric interval: " + err.Error())
 		}
-	}()
+
+		go func() {
+			for {
+				server.updateClusterMetricNamepaces()
+				time.Sleep(checkInterval)
+			}
+		}()
+	}
 
 	return nil
 }
@@ -333,20 +340,26 @@ func (server *Server) updateClusterMetricNamepaces() {
 		nowClusterMetricSize := len(cp.ClusterMetrics.Keys)
 		if nowClusterMetricSize > 0 && cp.ClusterMetrics.Size == 0 {
 			cp.ClusterMetrics.Size = nowClusterMetricSize
-			server.AuthDB.WriteMetrics(
-				"clustermetrics",
-				cp.ClusterMetrics,
-			)
+			if err := server.AuthDB.WriteMetrics("clustermetrics", cp.ClusterMetrics); err != nil {
+				log.WithFields(log.Fields{
+					"clusterId": cp.ClusterMetrics.ClusterId,
+				}).Warnf("Unable to write cluster metrics to mongo: %s", err.Error())
+			}
 			continue
 		}
 
 		if nowClusterMetricSize > cp.ClusterMetrics.Size {
 			cp.ClusterMetrics.Size = nowClusterMetricSize
-			server.AuthDB.UpsertMetrics(
+			err := server.AuthDB.UpsertMetrics(
 				"clustermetrics",
 				bson.M{"clusterId": cp.ClusterMetrics.ClusterId},
 				cp.ClusterMetrics,
 			)
+			if err != nil {
+				log.WithFields(log.Fields{
+					"clusterId": cp.ClusterMetrics.ClusterId,
+				}).Warnf("Unable to update cluster metrics to mongo: %s", err.Error())
+			}
 		}
 	}
 }
