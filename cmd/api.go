@@ -19,6 +19,7 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/prompb"
 	"github.com/spf13/viper"
+	"gopkg.in/mgo.v2/bson"
 
 	influx "github.com/influxdata/influxdb/client/v2"
 	log "github.com/sirupsen/logrus"
@@ -60,7 +61,6 @@ func NewServer(cfg *viper.Viper) *Server {
 	return &Server{
 		Config: cfg,
 		AuthDB: db.NewAuthDB(cfg),
-
 		InfluxdbConfig: &InfluxdbConfig{
 			FilterMetricPatterns: make([]glob.Glob, 0),
 			Username:             "root", // TODO: Make this configurable
@@ -106,6 +106,10 @@ func (server *Server) Init() error {
 	for _, customerCfg := range customers {
 		customerProfile := &CustomerProfile{
 			Config: &customerCfg,
+			ClusterMetrics: &hpmodel.ClusterMetrics{
+				ClusterId: customerCfg.ClusterId,
+				Keys:      make([]string, 0),
+			},
 		}
 		if err := buildClients(server.InfluxdbConfig, customerProfile); err != nil {
 			return fmt.Errorf("Unable to build customer clients %s: %s", customerCfg.OrgId, err.Error())
@@ -115,6 +119,20 @@ func (server *Server) Init() error {
 			return fmt.Errorf("Unable tp create hyperpilot writer %s: %s", customerCfg.OrgId, err.Error())
 		}
 		server.CustomerProfiles[customerCfg.OrgId] = customerProfile
+	}
+
+	if server.Config.GetBool("clusterMetric.writeMongo") {
+		checkInterval, err := time.ParseDuration(server.Config.GetString("clusterMetric.interval"))
+		if err != nil {
+			return errors.New("Unable to parse cluster metric interval: " + err.Error())
+		}
+
+		go func() {
+			for {
+				server.updateClusterMetricNamepaces()
+				time.Sleep(checkInterval)
+			}
+		}()
 	}
 
 	return nil
@@ -163,6 +181,7 @@ type reader interface {
 
 type CustomerProfile struct {
 	Config           *hpmodel.Organization
+	ClusterMetrics   *hpmodel.ClusterMetrics
 	writer           writer
 	reader           reader
 	HyperpilotWriter *HyperpilotWriter
@@ -185,6 +204,10 @@ func (server *Server) getCustomerProfile(token, clusterId, orgId string) (*Custo
 
 	customerProfile = &CustomerProfile{
 		Config: customerConfig,
+		ClusterMetrics: &hpmodel.ClusterMetrics{
+			ClusterId: customerConfig.ClusterId,
+			Keys:      make([]string, 0),
+		},
 	}
 
 	if err := buildClients(server.InfluxdbConfig, customerProfile); err != nil {
@@ -237,7 +260,7 @@ func (server *Server) write(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	samples := protoToSamples(&req, server.InfluxdbConfig.FilterMetricPatterns)
+	samples := protoToSamples(&req, server.InfluxdbConfig.FilterMetricPatterns, customerProfile.ClusterMetrics)
 	receivedSamples.Add(float64(len(samples)))
 	customerProfile.HyperpilotWriter.Put(samples)
 }
@@ -309,6 +332,38 @@ func (server *Server) read(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (server *Server) updateClusterMetricNamepaces() {
+	server.customerProfileLock.RLock()
+	defer server.customerProfileLock.RUnlock()
+
+	for _, cp := range server.CustomerProfiles {
+		nowClusterMetricSize := len(cp.ClusterMetrics.Keys)
+		if nowClusterMetricSize > 0 && cp.ClusterMetrics.Size == 0 {
+			cp.ClusterMetrics.Size = nowClusterMetricSize
+			if err := server.AuthDB.WriteMetrics("clustermetrics", cp.ClusterMetrics); err != nil {
+				log.WithFields(log.Fields{
+					"clusterId": cp.ClusterMetrics.ClusterId,
+				}).Warnf("Unable to write cluster metrics to mongo: %s", err.Error())
+			}
+			continue
+		}
+
+		if nowClusterMetricSize > cp.ClusterMetrics.Size {
+			cp.ClusterMetrics.Size = nowClusterMetricSize
+			err := server.AuthDB.UpsertMetrics(
+				"clustermetrics",
+				bson.M{"clusterId": cp.ClusterMetrics.ClusterId},
+				cp.ClusterMetrics,
+			)
+			if err != nil {
+				log.WithFields(log.Fields{
+					"clusterId": cp.ClusterMetrics.ClusterId,
+				}).Warnf("Unable to update cluster metrics to mongo: %s", err.Error())
+			}
+		}
+	}
+}
+
 type metricInfo struct {
 	Version_ int `json:"version":"version"`
 }
@@ -357,7 +412,10 @@ func buildClients(influxConfig *InfluxdbConfig, cp *CustomerProfile) error {
 	return nil
 }
 
-func protoToSamples(req *prompb.WriteRequest, filterMetricPatterns []glob.Glob) model.Samples {
+func protoToSamples(
+	req *prompb.WriteRequest,
+	filterMetricPatterns []glob.Glob,
+	cm *hpmodel.ClusterMetrics) model.Samples {
 	var samples model.Samples
 	for _, ts := range req.Timeseries {
 		metric := make(model.Metric, len(ts.Labels))
@@ -366,6 +424,7 @@ func protoToSamples(req *prompb.WriteRequest, filterMetricPatterns []glob.Glob) 
 		}
 
 		metricName := metric[model.MetricNameLabel]
+		cm.Add(string(metricName))
 		for _, s := range ts.Samples {
 			isAppendMetric := false
 			if len(filterMetricPatterns) == 0 {
