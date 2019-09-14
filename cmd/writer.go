@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"time"
+	"golang.org/x/time/rate"
 
 	"github.com/cenkalti/backoff"
 	"github.com/hyperpilotio/remote_storage_adapter/pkg/common/queue"
@@ -15,15 +16,21 @@ type HyperpilotWriter struct {
 	Writer     writer
 	CustomerId string
 	Server     *Server
+
+	limiter *rate.Limiter
 }
 
 func NewHyperpilotWriter(server *Server, w writer, customerId string) (*HyperpilotWriter, error) {
 	queueSize := server.Config.GetInt("writer.queueSize")
+	r := server.Config.GetInt("writer.batchSize")
+	burst := server.Config.GetInt("writer.queueSize")
+
 	return &HyperpilotWriter{
 		Queue:      queue.NewCappedQueue(queueSize),
 		Writer:     w,
 		CustomerId: customerId,
 		Server:     server,
+		limiter:    rate.NewLimiter(rate.Limit(r), burst),
 	}, nil
 }
 
@@ -74,7 +81,15 @@ func (hpwriter *HyperpilotWriter) Run() {
 					log.Warnf("Writer {%s} push sample fail, %d sample are dropped: %s",
 						hpwriter.CustomerId, len(batchSamples), err.Error())
 				}
-				time.Sleep(1 * time.Second)
+
+				now := time.Now()
+				rv := hpwriter.limiter.ReserveN(now, hpwriter.Server.Config.GetInt("writer.batchSize"))
+				if !rv.OK() {
+					log.Warnf("Exceeds limiter's burst")
+					continue
+				}
+				delay := rv.DelayFrom(now)
+				time.Sleep(delay)
 			}
 		}
 	}()
